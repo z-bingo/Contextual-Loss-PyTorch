@@ -8,14 +8,17 @@ class Distance_Type:
     L1_Distance = 1
     Cosine_Distance = 2
 
-"""
-config file is a dict.
-layers_weights: dict, e.g., {'conv_1_1': 1.0, 'conv_3_2': 1.0}
-crop_quarter: boolean
 
-"""
 class Contextual_Loss(nn.Module):
     def __init__(self, layers_weights, crop_quarter=False, max_1d_size=100, distance_type=Distance_Type.Cosine_Distance, b=1.0, h=0.1):
+        """
+        :param layers_weights: a dict, e.g. {'conv_1_2': 1.0, 'conv_2_3': 0.5} and so on, the number is weights of corresponding layers
+        :param crop_quarter: True or False, if True, converting a tensor of size [N, C, H, W] to [4N, C, H//2, W//2]
+        :param max_1d_size: ensure the faster computation, random pooling the tensor if its size is more bigger
+        :param distance_type: details as class Distance_Type
+        :param b: a constant, default is 1.0
+        :param h: a constant, typically 0.1
+        """
         super(Contextual_Loss, self).__init__()
         listen_list = []
         self.layers_weights = {}
@@ -34,6 +37,12 @@ class Contextual_Loss(nn.Module):
 
 
     def forward(self, images, gt):
+        """
+        Mention: variable images is a tensor of predicted results, gt is the ground of truth, their sizes are all [N,C,H,W]
+        :param images:
+        :param gt:
+        :return:
+        """
         vgg_images = self.vgg_pred(images)
         vgg_gt = self.vgg_gt(gt)
         batch = images.size(0)
@@ -204,7 +213,7 @@ class Contextual_Loss(nn.Module):
 
 
 if __name__ == '__main__':
-
+    # test
     layers = {
             "conv_2_2": 1.0,
             "conv_3_2": 0.5
