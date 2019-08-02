@@ -1,24 +1,26 @@
+import sys
+sys.path.append('../')
+
 import torch
 import torch.nn as nn
 from VGG_Model import VGG_Model
 import torch.nn.functional as F
+import copy
+import torchsnooper
 
 class Distance_Type:
     L2_Distance = 0
     L1_Distance = 1
     Cosine_Distance = 2
 
+"""
+config file is a dict.
+layers_weights: dict, e.g., {'conv_1_1': 1.0, 'conv_3_2': 1.0}
+crop_quarter: boolean
 
+"""
 class Contextual_Loss(nn.Module):
-    def __init__(self, layers_weights, crop_quarter=False, max_1d_size=100, distance_type=Distance_Type.Cosine_Distance, b=1.0, h=0.1):
-        """
-        :param layers_weights: a dict, e.g. {'conv_1_2': 1.0, 'conv_2_3': 0.5} and so on, the number is weights of corresponding layers
-        :param crop_quarter: True or False, if True, converting a tensor of size [N, C, H, W] to [4N, C, H//2, W//2]
-        :param max_1d_size: ensure the faster computation, random pooling the tensor if its size is more bigger
-        :param distance_type: details as class Distance_Type
-        :param b: a constant, default is 1.0
-        :param h: a constant, typically 0.1
-        """
+    def __init__(self, layers_weights, crop_quarter=False, max_1d_size=100, distance_type=Distance_Type.Cosine_Distance, b=1.0, h=0.1, cuda=True):
         super(Contextual_Loss, self).__init__()
         listen_list = []
         self.layers_weights = {}
@@ -28,7 +30,10 @@ class Contextual_Loss(nn.Module):
         except:
             pass
         self.vgg_pred = VGG_Model(listen_list=listen_list)
-        self.vgg_gt = VGG_Model(listen_list=listen_list)
+        # self.vgg_gt = VGG_Model(listen_list=listen_list)
+        # if cuda:
+        #     self.vgg_pred = nn.DataParallel(self.vgg_pred.cuda())
+            # self.vgg_gt = nn.DataParallel(self.vgg_gt.cuda())
         self.crop_quarter = crop_quarter
         self.distanceType = distance_type
         self.max_1d_size = max_1d_size
@@ -37,16 +42,21 @@ class Contextual_Loss(nn.Module):
 
 
     def forward(self, images, gt):
-        """
-        Mention: variable images is a tensor of predicted results, gt is the ground of truth, their sizes are all [N,C,H,W]
-        :param images:
-        :param gt:
-        :return:
-        """
-        vgg_images = self.vgg_pred(images)
-        vgg_gt = self.vgg_gt(gt)
-        batch = images.size(0)
-        loss = 0
+        if images.device.type == 'cpu':
+            loss = torch.zeros(1)
+            vgg_images = self.vgg_pred(images)
+            vgg_images = {k: v.clone() for k, v in vgg_images.items()}
+            vgg_gt = self.vgg_pred(gt)
+        else:
+            id_cuda = torch.cuda.current_device()
+            loss = torch.zeros(1).cuda(id_cuda)
+            vgg_images = self.vgg_pred(images)
+            vgg_images = {k: v.clone().cuda(id_cuda) for k, v in vgg_images.items()}
+            vgg_gt = self.vgg_pred(gt)
+            vgg_gt = {k: v.cuda(id_cuda) for k, v in vgg_gt.items()}
+        # print('images', [v.device for k, v in vgg_images.items()])
+        # print('gt', [v.device for k, v in vgg_gt.items()])
+
         for key in self.layers_weights.keys():
             N, C, H, W = vgg_images[key].size()
 
@@ -60,6 +70,7 @@ class Contextual_Loss(nn.Module):
             loss_t = self.calculate_CX_Loss(vgg_images[key], vgg_gt[key])
             # print(loss_t)
             loss += loss_t * self.layers_weights[key]
+            # del vgg_images[key], vgg_gt[key]
         return loss
 
 
@@ -69,10 +80,20 @@ class Contextual_Loss(nn.Module):
         S = H * W
         tensor = tensor.view(N, C, S)
         if indices is None:
-            indices = torch.randperm(S)[:n].contiguous()
+            indices = torch.randperm(S)[:n].contiguous().type_as(tensor).long()
             indices = indices.view(1, 1, -1).expand(N, C, -1)
+        indices = Contextual_Loss._move_to_current_device(indices)
+
+        # print('current_device', torch.cuda.current_device(), tensor.device, indices.device)
         res = torch.gather(tensor, index=indices, dim=-1)
         return res, indices
+
+    @staticmethod
+    def _move_to_current_device(tensor):
+        if tensor.device.type == 'cuda':
+            id = torch.cuda.current_device()
+            return tensor.cuda(id)
+        return tensor
 
     @staticmethod
     def _random_pooling(feats, output_1d_size=100):
@@ -157,6 +178,7 @@ class Contextual_Loss(nn.Module):
     @staticmethod
     def _centered_by_T(I, T):
         mean_T = T.mean(dim=0, keepdim=True).mean(dim=2, keepdim=True).mean(dim=3, keepdim=True)
+        # print(I.device, T.device, mean_T.device)
         return I-mean_T, T-mean_T
 
     @staticmethod
@@ -179,7 +201,8 @@ class Contextual_Loss(nn.Module):
             dist = F.conv2d(I_features_i, T_features_i).permute(0, 2, 3, 1).contiguous()
             cosine_dist.append(dist)
         cosine_dist = torch.cat(cosine_dist, dim=0)
-        cosine_dist = 1 - cosine_dist
+        cosine_dist = (1 - cosine_dist) / 2
+        cosine_dist = cosine_dist.clamp(min=0.0)
         return cosine_dist
 
 
@@ -196,30 +219,68 @@ class Contextual_Loss(nn.Module):
         return relative_dist
 
     def calculate_CX_Loss(self, I_features, T_features):
+        I_features = Contextual_Loss._move_to_current_device(I_features)
+        T_features = Contextual_Loss._move_to_current_device(T_features)
+
+        if torch.sum(torch.isnan(I_features)) == torch.numel(I_features) or torch.sum(torch.isinf(I_features)) == torch.numel(I_features):
+            print(I_features)
+            raise ValueError('NaN or Inf in I_features')
+        if torch.sum(torch.isnan(T_features)) == torch.numel(T_features) or torch.sum(
+                torch.isinf(T_features)) == torch.numel(T_features):
+            print(T_features)
+            raise ValueError('NaN or Inf in T_features')
+
         if self.distanceType == Distance_Type.L1_Distance:
             raw_distance = Contextual_Loss._create_using_L1(I_features, T_features)
         elif self.distanceType == Distance_Type.L2_Distance:
             raw_distance = Contextual_Loss._create_using_L2(I_features, T_features)
         else:
             raw_distance = Contextual_Loss._create_using_dotP(I_features, T_features)
+        if torch.sum(torch.isnan(raw_distance)) == torch.numel(raw_distance) or torch.sum(
+                torch.isinf(raw_distance)) == torch.numel(raw_distance):
+            print(raw_distance)
+            raise ValueError('NaN or Inf in raw_distance')
+
         relative_distance = Contextual_Loss._calculate_relative_distance(raw_distance)
+        if torch.sum(torch.isnan(relative_distance)) == torch.numel(relative_distance) or torch.sum(
+                torch.isinf(relative_distance)) == torch.numel(relative_distance):
+            print(relative_distance)
+            raise ValueError('NaN or Inf in relative_distance')
+        del raw_distance
+
         exp_distance = torch.exp((self.b - relative_distance) / self.h)
+        if torch.sum(torch.isnan(exp_distance)) == torch.numel(exp_distance) or torch.sum(
+                torch.isinf(exp_distance)) == torch.numel(exp_distance):
+            print(exp_distance)
+            raise ValueError('NaN or Inf in exp_distance')
+        del relative_distance
         # Similarity
         contextual_sim = exp_distance / torch.sum(exp_distance, dim=-1, keepdim=True)
+        if torch.sum(torch.isnan(contextual_sim)) == torch.numel(contextual_sim) or torch.sum(
+                torch.isinf(contextual_sim)) == torch.numel(contextual_sim):
+            print(contextual_sim)
+            raise ValueError('NaN or Inf in contextual_sim')
+        del exp_distance
         max_gt_sim = torch.max(torch.max(contextual_sim, dim=1)[0], dim=1)[0]
+        del contextual_sim
         CS = torch.mean(max_gt_sim, dim=1)
-        return torch.mean(-torch.log(CS))
+        CX_loss = torch.mean(-torch.log(CS))
+        if torch.isnan(CX_loss):
+            raise ValueError('NaN in computing CX_loss')
+        return CX_loss
 
 
 
 if __name__ == '__main__':
-    # test
+    from PIL import Image
+    from torchvision.transforms import transforms
+    import torch.nn.functional as F
     layers = {
-            "conv_2_2": 1.0,
-            "conv_3_2": 0.5
+            "conv_1_1": 1.0,
+            "conv_3_2": 1.0
         }
-    I = torch.rand(3, 3, 64, 64)
-    T = torch.randn(3, 3, 64, 64)
-    contex_loss = Contextual_Loss(layers)
+    I = torch.rand(1, 3, 128, 128).cuda()
+    T = torch.randn(1, 3, 128, 128).cuda()
+    contex_loss = Contextual_Loss(layers, max_1d_size=64).cuda()
     print(contex_loss(I, T))
 
